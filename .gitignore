@@ -1,0 +1,11 @@
+# DONT FUCKING SEND THESE
+*.mp4
+
+/build/
+*.exe
+*.out
+*.o
+*.obj
+
+kiri
+

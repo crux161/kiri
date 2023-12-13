@@ -1,4 +1,5 @@
 #include <libavformat/avformat.h>
+#include <libgen.h>
 
 // prototypes
 static const char *humanReadable(int64_t bytes);
@@ -47,11 +48,47 @@ int main(int argc, char *argv[]) {
     	for (int i = 0; i < (int) formatCtx->nb_streams; i++) {
         	if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         	    printf(" Codec:\t\t'%s'\n", avcodec_get_name(formatCtx->streams[i]->codecpar->codec_id));
-        	    printf(" Resolution:\t %03d x %03d\n", formatCtx->streams[i]->codecpar->width, formatCtx->streams[i]->codecpar->height);
+        	    printf(" Resolution:\t %03d x %03d\n\n", formatCtx->streams[i]->codecpar->width, formatCtx->streams[i]->codecpar->height);
         	}
     	}
 	
+	int chunks = segmentCheck(avio_size(formatCtx->pb));
+	char choice;
+	int lock = 1;
+	int confirm = 0;
 
+	char *operation_title = basename(input_file);
+	char *dot = strrchr(operation_title, '.');
+	if (dot != NULL) {
+		*dot = '\0';
+	}
+
+	if (chunks > 1) {
+		printf(" A directory named '%s' will be created with a copy of the movie in compatible segments.\n Do You want to proceed? (Y/N) ", operation_title);
+		scanf(" %c", &choice);
+		while (lock) {
+		    switch (choice) {
+			case 'y':
+			case 'Y':
+				printf(" Proceeding...\n");
+				lock = 0;
+				confirm = 1;
+				break;
+			case 'n':
+			case 'N':
+				printf(" Aborting...\n");
+				lock = 0;
+				break;
+			default:
+				printf(" Invalid input, enter 'y/Y' or 'n/N'...\n");
+				break;
+		    } 
+	        }
+	}
+
+	if (confirm) {
+		// TODO: implement split~!
+	}
 
 	avformat_close_input(&formatCtx);
 
@@ -77,6 +114,25 @@ static const char *humanReadable(int64_t bytes) {
 	BBytes = (LBytes / 1024);
 	sprintf(output, "%.02lf %s (%.02lf %s)", BBytes, sfx[b], LBytes, sfx[i]);
 	return output;
+}
+
+int segmentCheck(int64_t bytes) {
+    int64_t num_chunks = 0;
+    if (bytes <= 0) {
+        printf(" Invalid file size.\n");
+        return 1;
+    }
+
+    if (bytes > (4LL * 1024 * 1024 * 1024)) {
+        int64_t chunk_size = 4LL * 1024 * 1024 * 1024; // 4 GB
+        num_chunks = (bytes + chunk_size - 1) / chunk_size;
+
+        printf(" Number of chunks needed: %" PRId64 "\n", num_chunks);
+    } else {
+        printf(" File size is within the limit of 4 GB. Not splitting...\n");
+    }
+
+    return (int) num_chunks;
 }
 
 void banner() {
