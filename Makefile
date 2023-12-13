@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c11
+CFLAGS = -Wall -Wextra -std=c17 
 LDFLAGS = -lavformat -lavcodec -lavutil
 
 SRC = kiri.c
@@ -17,3 +17,7 @@ $(EXEC): $(OBJ)
 clean:
 	rm -f $(OBJ) $(EXEC)
 
+re:
+	make clean
+	make
+	./kiri bunny.mp4
