@@ -13,4 +13,5 @@ clean:
 re:
 	make clean
 	make
+	./get_test_data.sh
 	./kiri ./bunny.mp4
