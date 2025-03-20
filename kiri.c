@@ -1,5 +1,5 @@
 #include <libavformat/avformat.h>
-#include <libgen.h>
+#include "libgen.h"
 
 // prototypes
 static const char *humanReadable(int64_t bytes);
@@ -58,7 +58,7 @@ int main(int argc, char *argv[]) {
         int lock = 1;
         int confirm = 0;
 
-        char *operation_title = basename(input_file);
+        const char *operation_title = basename(input_file);
         char *dot = strrchr(operation_title, '.');
         if (dot != NULL) {
                 *dot = '\0';
