@@ -7,6 +7,8 @@
 .gitignore
 .*
 
+*.*.sha256
+
 /build/
 *.exe
 *.out
