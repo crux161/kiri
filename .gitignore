@@ -1,5 +1,11 @@
 # DONT FUCKING SEND THESE
 *.mp4
+*.mkv 
+
+._*
+._*.*
+.gitignore
+.*
 
 /build/
 *.exe
