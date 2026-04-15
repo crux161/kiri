@@ -1,397 +1,229 @@
+/*
+ * kiri.c — libkiri implementation
+ *
+ * Pure library code. No stdio, no prompts, no signal handlers. All reporting
+ * is funneled through the caller-supplied log and progress callbacks.
+ * Cooperative cancellation via the progress callback's return value.
+ */
+#include "kiri.h"
+
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/timestamp.h>
 #include <libavutil/opt.h>
+
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
 
-// --- Configuration ---
-#define SAFETY_MARGIN_BYTES (60LL * 1024 * 1024) // 60 MiB buffer before hard limit
-#define MIN_CHUNK_MIB       100                   // Minimum chunk size in MiB
-static const int64_t FAT32_MAX_BYTES = (4LL * 1024 * 1024 * 1024) - 1;
+#if defined(_WIN32)
+  #include <windows.h>
+  #ifndef PATH_MAX
+    #define PATH_MAX MAX_PATH
+  #endif
+#else
+  #include <sys/statvfs.h>
+#endif
 
-static const char *PROGRAM_NAME = "Kiri";
-static const float PROGRAM_VERSION = 1.3;
-static const char *AUTHOR = "crux161";
+/* --- Tunables --------------------------------------------------------- */
+#define KIRI_DEFAULT_SAFETY_MARGIN (60LL * 1024 * 1024)
+static const int64_t KIRI_FAT32_MAX = (4LL * 1024 * 1024 * 1024) - 1;
 
-// --- Signal handling for clean shutdown ---
-static volatile sig_atomic_t g_interrupted = 0;
-
-static void signal_handler(int sig) {
-    (void)sig;
-    g_interrupted = 1;
-}
-
-// --- State Tracking ---
+/* --- Internal state --------------------------------------------------- */
 typedef struct {
     int64_t pts_offset;
     int64_t dts_offset;
-    int64_t last_dts;      // To enforce monotonicity
-    int initialized;
-} StreamState;
+    int64_t last_dts;
+    int     initialized;
+} kiri_stream_state;
 
-// --- Prototypes ---
-static void    humanReadable(int64_t bytes, char *buf, size_t buf_size);
-static int     segmentCheck(int64_t bytes, int64_t max_bytes);
-static void    banner(void);
-static int     split_video(const char *input_file, const char *output_dir, const char *base_name, const char *ext,
-                           int64_t max_bytes, int total_segments, int make_playlist);
-static int     make_output_dir(const char *output_dir);
-static void    split_path(const char *input_file, char *base_name, size_t base_size, char *ext, size_t ext_size);
-static int     open_output_segment(AVFormatContext *input_ctx, AVFormatContext **output_ctx,
-                                   const char *output_path, int64_t prealloc_size,
-                                   int *stream_map, int *out_nb_streams);
-static void    close_output_segment(AVFormatContext **output_ctx);
-static int     digits_for_int(int value);
-static int64_t ask_chunk_size(int64_t file_size, int64_t suggested_max);
-static int64_t chunks_for_size(int64_t file_size, int64_t chunk_size);
-static int     check_disk_space(const char *path, int64_t required_bytes);
-static void    preallocate_file(const char *path, int64_t size);
+typedef struct {
+    const kiri_split_options *opts;
+    kiri_progress_fn progress;
+    kiri_log_fn      log;
+    void            *user;
+} kiri_ctx;
 
-// --- Main ---
-int main(int argc, char *argv[]) {
-    // Silence non-critical errors to keep UI clean, but allow criticals
-    av_log_set_level(AV_LOG_ERROR);
-
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <input> [--playlist|-p]\n", argv[0]);
-        return 1;
-    }
-
-    const char *input_file = argv[1];
-    int make_playlist = 0;
-
-    for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--playlist") == 0 || strcmp(argv[i], "-p") == 0) {
-            make_playlist = 1;
-        } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            return 1;
-        }
-    }
-
-    AVFormatContext *formatCtx = avformat_alloc_context();
-    if (avformat_open_input(&formatCtx, input_file, NULL, NULL) != 0) {
-        fprintf(stderr, "Error: Could not open input file '%s'.\n", input_file);
-        return 2;
-    }
-
-    if (avformat_find_stream_info(formatCtx, NULL) < 0) {
-        fprintf(stderr, "Error: Could not find stream information.\n");
-        avformat_close_input(&formatCtx);
-        return 3;
-    }
-
-    banner();
-
-    char hr_buf[64];
-    printf(" File:\t\t'%s'\n", input_file);
-    printf(" Format:\t'%s'\n", formatCtx->iformat->long_name);
-    humanReadable(avio_size(formatCtx->pb), hr_buf, sizeof(hr_buf));
-    printf(" Size:\t\t %s\n", hr_buf);
-
-    // Correct Time Display (Handle NOPTS)
-    if (formatCtx->duration != AV_NOPTS_VALUE) {
-        int64_t duration = formatCtx->duration + (formatCtx->duration <= INT64_MAX - 5000 ? 5000 : 0);
-        int64_t secs = duration / AV_TIME_BASE;
-        printf(" Time:\t\t %02"PRId64":%02"PRId64":%02"PRId64"\n",
-            secs / 3600, (secs % 3600) / 60, secs % 60);
-    } else {
-        printf(" Time:\t\t [Unknown - Stream might be damaged]\n");
-    }
-
-    printf(" Streams:\t %d\n", formatCtx->nb_streams);
-
-    // Identify Video Stream
-    int has_video = 0;
-    for (unsigned int i = 0; i < formatCtx->nb_streams; i++) {
-        if (formatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            has_video = 1;
-            printf(" Codec:\t\t'%s'\n", avcodec_get_name(formatCtx->streams[i]->codecpar->codec_id));
-            printf(" Resolution:\t %d x %d\n\n", formatCtx->streams[i]->codecpar->width, formatCtx->streams[i]->codecpar->height);
-            break;
-        }
-    }
-
-    if (!has_video) {
-        printf(" Warning: No video stream found. Keyframe-aware splitting unavailable.\n\n");
-    }
-
-    int64_t file_size = avio_size(formatCtx->pb);
-    int chunks = segmentCheck(file_size, FAT32_MAX_BYTES);
-
-    char base_name[PATH_MAX] = {0};
-    char ext[PATH_MAX] = {0};
-    split_path(input_file, base_name, sizeof(base_name), ext, sizeof(ext));
-
-    int64_t chosen_chunk_size = 0;
-    if (chunks >= 1) {
-        chosen_chunk_size = ask_chunk_size(file_size, FAT32_MAX_BYTES);
-        int64_t chosen_chunks = chunks_for_size(file_size, chosen_chunk_size);
-
-        humanReadable(chosen_chunk_size, hr_buf, sizeof(hr_buf));
-        printf(" Selected chunk size: %s\n", hr_buf);
-        printf(" This will produce approximately %" PRId64 " chunk(s).\n", chosen_chunks);
-
-        printf(" A directory named '%s' will be created.\n Proceed? (Y/N) ", base_name);
-        fflush(stdout);
-
-        char input_buf[64];
-        int confirmed = 0;
-        while (1) {
-            if (!fgets(input_buf, sizeof(input_buf), stdin)) break;
-            char choice = input_buf[0];
-            if (choice == 'y' || choice == 'Y') { confirmed = 1; break; }
-            if (choice == 'n' || choice == 'N') { printf(" Aborting...\n"); break; }
-            printf(" Invalid input. (Y/N): ");
-            fflush(stdout);
-        }
-
-        if (confirmed) {
-            // 1. Check Space
-            if (check_disk_space(".", file_size) != 0) {
-                fprintf(stderr, " Error: Insufficient disk space.\n");
-                avformat_close_input(&formatCtx);
-                return 5;
-            }
-
-            // 2. Make Dir
-            if (make_output_dir(base_name) != 0) {
-                fprintf(stderr, " Error creating output directory '%s'.\n", base_name);
-                avformat_close_input(&formatCtx);
-                return 4;
-            }
-
-            // 3. Execute
-            printf(" Proceeding with split...\n");
-            int ret = split_video(input_file, base_name, base_name, ext,
-                                  chosen_chunk_size, (int)chosen_chunks, make_playlist);
-
-            if (ret != 0) {
-                char err_buf[AV_ERROR_MAX_STRING_SIZE];
-                av_strerror(ret, err_buf, sizeof(err_buf));
-                fprintf(stderr, "\n !!! SPLIT FAILED !!!\n Error Code: %d (%s)\n", ret, err_buf);
-                avformat_close_input(&formatCtx);
-                return ret;
-            }
-
-            if (g_interrupted) {
-                printf("\n Interrupted. Partial output in '%s/'.\n", base_name);
-            } else {
-                printf("\n Success! Output is in directory '%s/'\n", base_name);
-            }
-        }
-    }
-
-    avformat_close_input(&formatCtx);
-    return 0;
+/* --- Logging helpers -------------------------------------------------- */
+static void kiri_logf(const kiri_ctx *ctx, kiri_log_level lvl, const char *fmt, ...) {
+    if (!ctx->log) return;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ctx->log(ctx->user, lvl, buf);
 }
 
-// --- Helper Functions ---
-
-static void humanReadable(int64_t bytes, char *buf, size_t buf_size) {
-    const char *sfx[] = {"B", "KB", "MB", "GB"};
-    int len = sizeof(sfx) / sizeof(sfx[0]);
-    int i = 0;
-    double d_bytes = (double)bytes;
-    if (bytes > 1024) {
-        for (i = 0; (bytes / 1024) > 0 && i < (len - 1); i++, bytes /= 1024) {
-            d_bytes = bytes / 1024.0;
-        }
-    }
-    snprintf(buf, buf_size, "%.2f %s", d_bytes, sfx[i]);
+static void kiri_log_ffmpeg(const kiri_ctx *ctx, kiri_log_level lvl,
+                             const char *prefix, int averr) {
+    char ebuf[AV_ERROR_MAX_STRING_SIZE];
+    av_strerror(averr, ebuf, sizeof(ebuf));
+    kiri_logf(ctx, lvl, "%s: %s", prefix, ebuf);
 }
 
-// macOS/POSIX Disk Space Check
-static int check_disk_space(const char *path, int64_t required_bytes) {
-    struct statvfs st;
-    if (statvfs(path, &st) != 0) {
-        perror("statvfs");
-        return -1;
-    }
-    int64_t available = (int64_t)st.f_bavail * st.f_frsize;
-    if (available < (required_bytes + 100 * 1024 * 1024)) { // 100MB Buffer
-        char need_buf[64], have_buf[64];
-        humanReadable(required_bytes, need_buf, sizeof(need_buf));
-        humanReadable(available, have_buf, sizeof(have_buf));
-        printf(" Warning: Low disk space! Need: %s, Have: %s\n", need_buf, have_buf);
-        return -1;
-    }
-    return 0;
-}
+/* --- Portable filesystem helpers ------------------------------------- */
 
-// Pre-allocation helper (macOS / POSIX)
-// Must be called AFTER the file is created by avio_open, so the allocation
-// isn't immediately truncated away.
-static void preallocate_file(const char *path, int64_t size) {
+/*
+ * Pre-allocation. On macOS reserves contiguous blocks without changing the
+ * logical file size. On Linux uses fallocate+KEEP_SIZE. Best-effort: failure
+ * is non-fatal.
+ *
+ * NOTE: must be called AFTER the file has been created (by avio_open) —
+ * otherwise the subsequent open-with-truncate discards the reservation.
+ */
+static void kiri_preallocate(const char *path, int64_t size) {
+    if (size <= 0) return;
     int fd = open(path, O_RDWR);
     if (fd == -1) return;
 
 #ifdef __APPLE__
-    // macOS: F_PREALLOCATE reserves disk blocks without changing logical size
-    fstore_t store = {F_ALLOCATECONTIG, F_PEOFPOSMODE, 0, size, 0};
+    fstore_t store = { F_ALLOCATECONTIG, F_PEOFPOSMODE, 0, size, 0 };
     if (fcntl(fd, F_PREALLOCATE, &store) == -1) {
         store.fst_flags = F_ALLOCATEALL;
-        fcntl(fd, F_PREALLOCATE, &store);
+        (void)fcntl(fd, F_PREALLOCATE, &store);
     }
-    // Do NOT ftruncate — that would confuse FFmpeg's position tracking
-#else
-    // Generic POSIX fallback
-    posix_fallocate(fd, 0, size);
+#elif defined(__linux__)
+    #ifdef FALLOC_FL_KEEP_SIZE
+      (void)fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, size);
+    #else
+      (void)posix_fallocate(fd, 0, size);
+    #endif
+#elif !defined(_WIN32)
+    (void)posix_fallocate(fd, 0, size);
 #endif
 
     close(fd);
 }
 
-static int segmentCheck(int64_t bytes, int64_t max_bytes) {
-    if (bytes <= 0) return 1;
-    if (bytes > max_bytes) {
-        return (int)((bytes + max_bytes - 1) / max_bytes);
-    }
-    return 1;
-}
+static int kiri_check_disk_space(const char *path, int64_t required_bytes) {
+    /* 100MB cushion on top of the raw requirement */
+    int64_t cushion = 100LL * 1024 * 1024;
 
-static void banner(void) {
-    printf("\n=======================================\n");
-    printf(" %s v%.2f\t FAT32 FFmpeg Splitter\n", PROGRAM_NAME, PROGRAM_VERSION);
-    printf("---------------------------------------\n");
-    printf(" %s\n", AUTHOR);
-    printf("=======================================\n");
-}
-
-static int make_output_dir(const char *output_dir) {
-    if (mkdir(output_dir, 0755) != 0) {
-        if (errno == EEXIST) return 0;
-        return -1;
-    }
+#if defined(_WIN32)
+    ULARGE_INTEGER avail;
+    if (!GetDiskFreeSpaceExA(path, &avail, NULL, NULL)) return -1;
+    if ((int64_t)avail.QuadPart < required_bytes + cushion) return -1;
     return 0;
+#else
+    struct statvfs st;
+    if (statvfs(path, &st) != 0) return -1;
+    int64_t available = (int64_t)st.f_bavail * (int64_t)st.f_frsize;
+    if (available < required_bytes + cushion) return -1;
+    return 0;
+#endif
 }
 
-static void split_path(const char *input_file, char *base_name, size_t base_size, char *ext, size_t ext_size) {
-    const char *slash = strrchr(input_file, '/');
-    const char *filename = slash ? (slash + 1) : input_file;
+/* --- Path parsing ----------------------------------------------------- */
+static void kiri_split_path(const char *input_file,
+                             char *basename, size_t base_size,
+                             char *extension, size_t ext_size) {
+    const char *slash_fwd = strrchr(input_file, '/');
+#ifdef _WIN32
+    const char *slash_back = strrchr(input_file, '\\');
+    const char *slash = slash_back > slash_fwd ? slash_back : slash_fwd;
+#else
+    const char *slash = slash_fwd;
+#endif
+    const char *filename = slash ? slash + 1 : input_file;
     const char *dot = strrchr(filename, '.');
     size_t base_len = dot ? (size_t)(dot - filename) : strlen(filename);
-
     if (base_len >= base_size) base_len = base_size - 1;
-    memcpy(base_name, filename, base_len);
-    base_name[base_len] = '\0';
+    memcpy(basename, filename, base_len);
+    basename[base_len] = '\0';
 
-    if (dot != NULL) {
+    if (dot) {
         size_t ext_len = strlen(dot);
         if (ext_len >= ext_size) ext_len = ext_size - 1;
-        memcpy(ext, dot, ext_len);
-        ext[ext_len] = '\0';
-    } else ext[0] = '\0';
+        memcpy(extension, dot, ext_len);
+        extension[ext_len] = '\0';
+    } else {
+        extension[0] = '\0';
+    }
 }
 
-static int digits_for_int(int value) {
+static int kiri_digits_for_int(int value) {
     int digits = 1;
     while (value >= 10) { value /= 10; digits++; }
     return digits;
 }
 
-static int64_t chunks_for_size(int64_t file_size, int64_t chunk_size) {
-    if (file_size <= 0 || chunk_size <= 0) return 1;
-    return (file_size + chunk_size - 1) / chunk_size;
-}
+/* --- Output segment lifecycle ---------------------------------------- */
 
-static int64_t ask_chunk_size(int64_t file_size, int64_t suggested_max) {
-    char buffer[64];
-    int64_t max_mib = suggested_max / (1024LL * 1024);
-    char hr_buf[64];
-
-    humanReadable(suggested_max, hr_buf, sizeof(hr_buf));
-    printf(" Suggested chunk size: %s\n", hr_buf);
-    printf(" Estimated chunks: %" PRId64 "\n", chunks_for_size(file_size, suggested_max));
-
-    while (1) {
-        printf("\n Choose chunk size:\n");
-        printf("  [1] Suggested max (%" PRId64 " MiB)\n", max_mib);
-        printf("  [2] Custom size in MiB (%d - %" PRId64 ")\n", MIN_CHUNK_MIB, max_mib);
-        printf(" Select option (1/2): ");
-        fflush(stdout);
-
-        if (!fgets(buffer, sizeof(buffer), stdin)) return suggested_max;
-        int choice = (int)strtol(buffer, NULL, 10);
-
-        if (choice == 1) return suggested_max;
-        if (choice == 2) {
-            printf(" Enter chunk size in MiB: ");
-            fflush(stdout);
-            if (!fgets(buffer, sizeof(buffer), stdin)) return suggested_max;
-            int64_t custom_mib = strtoll(buffer, NULL, 10);
-            if (custom_mib >= MIN_CHUNK_MIB && custom_mib <= max_mib) {
-                return custom_mib * 1024LL * 1024;
-            }
-            printf(" Invalid size. Must be between %d and %" PRId64 " MiB.\n", MIN_CHUNK_MIB, max_mib);
-            continue;
-        }
-    }
-}
-
-static int open_output_segment(AVFormatContext *input_ctx, AVFormatContext **output_ctx,
-                               const char *output_path, int64_t prealloc_size,
-                               int *stream_map, int *out_nb_streams) {
+/*
+ * Open a new output segment. Builds a stream mapping that drops streams the
+ * output container can't mux (data, timecode, attachments). `stream_map[i]`
+ * is set to the output stream index or -1 to skip. Preallocation runs AFTER
+ * avio_open so the reservation isn't truncated away.
+ */
+static int kiri_open_segment(const kiri_ctx      *ctx,
+                              AVFormatContext    *input_ctx,
+                              AVFormatContext   **output_ctx,
+                              const char         *output_path,
+                              int64_t             prealloc_size,
+                              int                *stream_map) {
     AVFormatContext *out_ctx = NULL;
     int ret = avformat_alloc_output_context2(&out_ctx, NULL, NULL, output_path);
-    if (ret < 0 || !out_ctx) return -1;
+    if (ret < 0 || !out_ctx) {
+        kiri_log_ffmpeg(ctx, KIRI_LOG_ERROR, "avformat_alloc_output_context2", ret);
+        return KIRI_ERR_FFMPEG;
+    }
 
     int out_idx = 0;
     for (unsigned int i = 0; i < input_ctx->nb_streams; i++) {
         AVStream *in_stream = input_ctx->streams[i];
-        enum AVMediaType type = in_stream->codecpar->codec_type;
-
-        // Only copy streams the output container can handle
-        if (type != AVMEDIA_TYPE_VIDEO && type != AVMEDIA_TYPE_AUDIO && type != AVMEDIA_TYPE_SUBTITLE) {
+        enum AVMediaType t = in_stream->codecpar->codec_type;
+        if (t != AVMEDIA_TYPE_VIDEO && t != AVMEDIA_TYPE_AUDIO && t != AVMEDIA_TYPE_SUBTITLE) {
             stream_map[i] = -1;
             continue;
         }
-
         AVStream *out_stream = avformat_new_stream(out_ctx, NULL);
-        if (!out_stream) { avformat_free_context(out_ctx); return -1; }
-
+        if (!out_stream) { avformat_free_context(out_ctx); return KIRI_ERR_ALLOC; }
         ret = avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar);
-        if (ret < 0) { avformat_free_context(out_ctx); return ret; }
-
+        if (ret < 0) {
+            kiri_log_ffmpeg(ctx, KIRI_LOG_ERROR, "avcodec_parameters_copy", ret);
+            avformat_free_context(out_ctx);
+            return KIRI_ERR_FFMPEG;
+        }
         out_stream->time_base = in_stream->time_base;
         out_stream->codecpar->codec_tag = 0;
         stream_map[i] = out_idx++;
     }
-    if (out_nb_streams) *out_nb_streams = out_idx;
 
     if (!(out_ctx->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open(&out_ctx->pb, output_path, AVIO_FLAG_WRITE);
-        if (ret < 0) { avformat_free_context(out_ctx); return ret; }
+        if (ret < 0) {
+            kiri_log_ffmpeg(ctx, KIRI_LOG_ERROR, "avio_open", ret);
+            avformat_free_context(out_ctx);
+            return KIRI_ERR_OPEN_OUTPUT;
+        }
     }
 
-    // Pre-allocate AFTER avio_open so the allocation isn't truncated
     if (prealloc_size > 0) {
-        preallocate_file(output_path, prealloc_size);
+        kiri_preallocate(output_path, prealloc_size);
     }
 
     ret = avformat_write_header(out_ctx, NULL);
     if (ret < 0) {
+        kiri_log_ffmpeg(ctx, KIRI_LOG_ERROR, "avformat_write_header", ret);
         avio_closep(&out_ctx->pb);
         avformat_free_context(out_ctx);
-        return ret;
+        return KIRI_ERR_WRITE;
     }
 
     *output_ctx = out_ctx;
-    return 0;
+    return KIRI_OK;
 }
 
-static void close_output_segment(AVFormatContext **output_ctx) {
-    if (output_ctx == NULL || *output_ctx == NULL) return;
+static void kiri_close_segment(AVFormatContext **output_ctx) {
+    if (!output_ctx || !*output_ctx) return;
     av_write_trailer(*output_ctx);
     if (!((*output_ctx)->oformat->flags & AVFMT_NOFILE)) {
         avio_closep(&(*output_ctx)->pb);
@@ -400,47 +232,142 @@ static void close_output_segment(AVFormatContext **output_ctx) {
     *output_ctx = NULL;
 }
 
-// --- The Core Splitter ---
-static int split_video(const char *input_file, const char *output_dir, const char *base_name, const char *ext,
-                       int64_t max_bytes, int total_segments, int make_playlist) {
+/* --- Public API ------------------------------------------------------- */
+
+KIRI_API const char *kiri_version_string(void) {
+    static const char v[] = "2.0.0";
+    return v;
+}
+
+KIRI_API int64_t kiri_fat32_max_bytes(void) {
+    return KIRI_FAT32_MAX;
+}
+
+KIRI_API int64_t kiri_chunk_count(int64_t file_size_bytes, int64_t chunk_size_bytes) {
+    if (file_size_bytes <= 0 || chunk_size_bytes <= 0) return 1;
+    return (file_size_bytes + chunk_size_bytes - 1) / chunk_size_bytes;
+}
+
+KIRI_API const char *kiri_strerror(kiri_status s) {
+    switch (s) {
+        case KIRI_OK:              return "OK";
+        case KIRI_ERR_INVALID_ARG: return "invalid argument";
+        case KIRI_ERR_OPEN_INPUT:  return "failed to open input";
+        case KIRI_ERR_STREAM_INFO: return "failed to read stream info";
+        case KIRI_ERR_NO_STREAMS:  return "no supported streams found";
+        case KIRI_ERR_OPEN_OUTPUT: return "failed to open output";
+        case KIRI_ERR_WRITE:       return "write failed";
+        case KIRI_ERR_ALLOC:       return "allocation failed";
+        case KIRI_ERR_MKDIR:       return "mkdir failed";
+        case KIRI_ERR_DISK_SPACE:  return "insufficient disk space";
+        case KIRI_ERR_INTERRUPTED: return "interrupted by caller";
+        case KIRI_ERR_IO:          return "I/O error";
+        case KIRI_ERR_FFMPEG:      return "FFmpeg error (see log)";
+    }
+    return "unknown";
+}
+
+KIRI_API kiri_status kiri_probe(const char *input_path, kiri_input_info *info) {
+    if (!input_path || !info) return KIRI_ERR_INVALID_ARG;
+    memset(info, 0, sizeof(*info));
+    info->duration_us = -1;
+
+    AVFormatContext *ctx = NULL;
+    int r = avformat_open_input(&ctx, input_path, NULL, NULL);
+    if (r != 0) return KIRI_ERR_OPEN_INPUT;
+    if (avformat_find_stream_info(ctx, NULL) < 0) {
+        avformat_close_input(&ctx);
+        return KIRI_ERR_STREAM_INFO;
+    }
+
+    info->size_bytes  = avio_size(ctx->pb);
+    info->duration_us = ctx->duration == AV_NOPTS_VALUE ? -1 : ctx->duration;
+    info->nb_streams  = (int)ctx->nb_streams;
+    snprintf(info->format_long_name, sizeof(info->format_long_name),
+             "%s", ctx->iformat->long_name ? ctx->iformat->long_name : "");
+
+    for (unsigned int i = 0; i < ctx->nb_streams; i++) {
+        AVCodecParameters *cp = ctx->streams[i]->codecpar;
+        if (cp->codec_type == AVMEDIA_TYPE_VIDEO) {
+            info->has_video    = 1;
+            info->video_width  = cp->width;
+            info->video_height = cp->height;
+            const char *name = avcodec_get_name(cp->codec_id);
+            snprintf(info->video_codec_name, sizeof(info->video_codec_name),
+                     "%s", name ? name : "");
+            break;
+        }
+    }
+
+    avformat_close_input(&ctx);
+    return KIRI_OK;
+}
+
+KIRI_API kiri_status kiri_split(const kiri_split_options *opts) {
+    if (!opts || !opts->input_path || !opts->output_dir || opts->max_bytes <= 0)
+        return KIRI_ERR_INVALID_ARG;
+
+    kiri_ctx ctx = {
+        .opts = opts,
+        .progress = opts->on_progress,
+        .log = opts->on_log,
+        .user = opts->user_data
+    };
+
+    /* Resolve derived options */
+    char derived_base[PATH_MAX] = {0};
+    char derived_ext[PATH_MAX]  = {0};
+    kiri_split_path(opts->input_path, derived_base, sizeof(derived_base),
+                     derived_ext, sizeof(derived_ext));
+    const char *basename  = opts->basename  ? opts->basename  : derived_base;
+    const char *extension = opts->extension ? opts->extension : derived_ext;
+
+    int64_t safety_margin = opts->safety_margin_bytes > 0
+                          ? opts->safety_margin_bytes
+                          : KIRI_DEFAULT_SAFETY_MARGIN;
+    if (safety_margin >= opts->max_bytes) {
+        kiri_logf(&ctx, KIRI_LOG_ERROR,
+                  "safety_margin (%lld) must be < max_bytes (%lld)",
+                  (long long)safety_margin, (long long)opts->max_bytes);
+        return KIRI_ERR_INVALID_ARG;
+    }
+
+    int64_t prealloc = opts->preallocate_bytes;
+    if (prealloc < 0) prealloc = opts->max_bytes;
+
+    /* Open input */
     AVFormatContext *input_ctx = NULL;
-    AVFormatContext *output_ctx = NULL;
-    AVPacket packet;
-    int ret = 0;
-    int current_segment = 1;
-    int width = digits_for_int(total_segments);
-    int video_stream_index = -1;
-    char output_path[PATH_MAX];
-    FILE *playlist = NULL;
-
-    // State for every stream to handle corruption and offsets
-    StreamState *states = NULL;
-
-    // Install signal handlers for clean shutdown
-    struct sigaction sa = {0};
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-
-    if (avformat_open_input(&input_ctx, input_file, NULL, NULL) != 0) return 2;
+    int r = avformat_open_input(&input_ctx, opts->input_path, NULL, NULL);
+    if (r != 0) {
+        kiri_log_ffmpeg(&ctx, KIRI_LOG_ERROR, "avformat_open_input", r);
+        return KIRI_ERR_OPEN_INPUT;
+    }
     if (avformat_find_stream_info(input_ctx, NULL) < 0) {
         avformat_close_input(&input_ctx);
-        return 3;
+        return KIRI_ERR_STREAM_INFO;
     }
 
     int64_t input_size = avio_size(input_ctx->pb);
+    int total_segments = (int)kiri_chunk_count(input_size, opts->max_bytes);
+    int width = kiri_digits_for_int(total_segments);
 
-    states = calloc(input_ctx->nb_streams, sizeof(StreamState));
-    if (!states) {
-        avformat_close_input(&input_ctx);
-        return AVERROR(ENOMEM);
+    /* Disk space check — best-effort */
+    if (kiri_check_disk_space(opts->output_dir, input_size) != 0) {
+        kiri_logf(&ctx, KIRI_LOG_WARN, "low or unknown disk space on '%s'", opts->output_dir);
     }
 
-    // Initialize last_dts to a safe negative
+    /* State allocations */
+    kiri_stream_state *states = calloc(input_ctx->nb_streams, sizeof(*states));
+    int *stream_map = calloc(input_ctx->nb_streams, sizeof(int));
+    if (!states || !stream_map) {
+        free(states); free(stream_map);
+        avformat_close_input(&input_ctx);
+        return KIRI_ERR_ALLOC;
+    }
     for (unsigned int i = 0; i < input_ctx->nb_streams; i++)
         states[i].last_dts = AV_NOPTS_VALUE;
 
+    int video_stream_index = -1;
     for (unsigned int i = 0; i < input_ctx->nb_streams; i++) {
         if (input_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             video_stream_index = (int)i;
@@ -448,173 +375,167 @@ static int split_video(const char *input_file, const char *output_dir, const cha
         }
     }
 
-    // Stream mapping: input stream index -> output stream index (-1 = skip)
-    int *stream_map = calloc(input_ctx->nb_streams, sizeof(int));
-    if (!stream_map) {
-        free(states);
+    /* First output segment */
+    char output_path[PATH_MAX];
+    int current_segment = 1;
+    AVFormatContext *output_ctx = NULL;
+    snprintf(output_path, sizeof(output_path), "%s/%s_%0*d%s",
+             opts->output_dir, basename, width, current_segment, extension);
+    kiri_status s = kiri_open_segment(&ctx, input_ctx, &output_ctx,
+                                      output_path, prealloc, stream_map);
+    if (s != KIRI_OK) {
+        free(states); free(stream_map);
         avformat_close_input(&input_ctx);
-        return AVERROR(ENOMEM);
+        return s;
     }
 
-    // Track segment timing for playlist durations
+    /* Playlist */
+    FILE *playlist = NULL;
+    if (opts->make_playlist) {
+        char pl_path[PATH_MAX];
+        snprintf(pl_path, sizeof(pl_path), "%s/%s.m3u8", opts->output_dir, basename);
+        playlist = fopen(pl_path, "w");
+        if (playlist) fprintf(playlist, "#EXTM3U\n");
+        else kiri_logf(&ctx, KIRI_LOG_WARN, "could not open playlist '%s'", pl_path);
+    }
+
+    /* Split loop state */
+    int64_t split_threshold = opts->max_bytes - safety_margin;
     int64_t segment_start_video_dts = 0;
-    int64_t last_video_dts = 0;
-    int     waiting_for_keyframe = 0;
-    int     out_nb_streams = 0;
+    int64_t last_video_dts          = 0;
+    int64_t segment_ref_us          = 0;
+    int     segment_ref_set         = 0;
+    int     waiting_for_keyframe    = 0;
+    int     aborted                 = 0;
 
-    snprintf(output_path, sizeof(output_path), "%s/%s_%0*d%s", output_dir, base_name, width, current_segment, ext);
-    if (open_output_segment(input_ctx, &output_ctx, output_path, max_bytes, stream_map, &out_nb_streams) < 0) {
-        free(stream_map);
-        free(states);
-        avformat_close_input(&input_ctx);
-        return -1;
-    }
+    AVPacket packet;
+    kiri_status final_status = KIRI_OK;
 
-    if (make_playlist) {
-        char playlist_path[PATH_MAX];
-        snprintf(playlist_path, sizeof(playlist_path), "%s/%s.m3u8", output_dir, base_name);
-        playlist = fopen(playlist_path, "w");
-        if (playlist) {
-            fprintf(playlist, "#EXTM3U\n");
-        }
-    }
-
-    int64_t split_threshold = max_bytes - SAFETY_MARGIN_BYTES;
-
-    while (!g_interrupted && av_read_frame(input_ctx, &packet) >= 0) {
-        // Skip streams not mapped to the output (data, timecode, etc.)
+    while (av_read_frame(input_ctx, &packet) >= 0) {
         if (stream_map[packet.stream_index] < 0) {
             av_packet_unref(&packet);
             continue;
         }
 
-        AVStream *in_stream = input_ctx->streams[packet.stream_index];
+        AVStream *in_stream  = input_ctx->streams[packet.stream_index];
         AVStream *out_stream = output_ctx->streams[stream_map[packet.stream_index]];
-        StreamState *st = &states[packet.stream_index];
+        kiri_stream_state *st = &states[packet.stream_index];
 
-        // 1. SANITIZER: Fix broken input timestamps
+        /* Sanitize broken timestamps */
         if (packet.pts == AV_NOPTS_VALUE) packet.pts = packet.dts;
         if (packet.dts == AV_NOPTS_VALUE) packet.dts = packet.pts;
         if (packet.dts == AV_NOPTS_VALUE) { packet.dts = 0; packet.pts = 0; }
 
-        // 2. MONOTONICITY: Ensure time never goes backwards (fixes "clips" issue)
-        if (st->last_dts != AV_NOPTS_VALUE && packet.dts <= st->last_dts) {
+        /* Enforce DTS monotonicity on corrupted streams */
+        if (st->last_dts != AV_NOPTS_VALUE && packet.dts < st->last_dts) {
             packet.dts = st->last_dts + 1;
             if (packet.pts < packet.dts) packet.pts = packet.dts;
         }
         st->last_dts = packet.dts;
 
-        // Track video DTS for playlist duration calculation
+        if (!segment_ref_set) {
+            segment_ref_us = av_rescale_q(packet.dts, in_stream->time_base, AV_TIME_BASE_Q);
+            segment_ref_set = 1;
+        }
+
         int is_video = (packet.stream_index == video_stream_index);
         if (is_video) last_video_dts = packet.dts;
 
-        // 3. SPLIT LOGIC
         int64_t current_size = avio_tell(output_ctx->pb);
         int is_keyframe = is_video && (packet.flags & AV_PKT_FLAG_KEY);
 
         int do_split = 0;
         if (current_size > split_threshold && is_keyframe) {
-            // Ideal: split on video keyframe after passing soft threshold
             do_split = 1;
-        } else if (current_size >= max_bytes) {
-            // Hard limit: must split even without keyframe
+        } else if (current_size >= opts->max_bytes) {
             do_split = 1;
-            if (!is_keyframe) {
-                waiting_for_keyframe = 1;
-            }
+            if (!is_keyframe) waiting_for_keyframe = 1;
         }
 
         if (do_split) {
-            // Calculate segment duration from video stream
             double seg_duration = 0.0;
             if (video_stream_index >= 0) {
                 AVRational tb = input_ctx->streams[video_stream_index]->time_base;
                 seg_duration = (double)(last_video_dts - segment_start_video_dts) * av_q2d(tb);
             }
 
-            close_output_segment(&output_ctx);
+            kiri_close_segment(&output_ctx);
 
-            // Write completed segment to playlist
             if (playlist) {
                 fprintf(playlist, "#EXTINF:%.3f,\n%s_%0*d%s\n",
                         seg_duration > 0.0 ? seg_duration : 0.0,
-                        base_name, width, current_segment, ext);
+                        basename, width, current_segment, extension);
             }
 
             current_segment++;
             segment_start_video_dts = last_video_dts;
+            segment_ref_us = av_rescale_q(packet.dts, in_stream->time_base, AV_TIME_BASE_Q);
 
-            // Progress
-            if (input_size > 0) {
+            if (ctx.progress) {
                 int64_t pos = avio_tell(input_ctx->pb);
-                double pct = 100.0 * (double)pos / (double)input_size;
-                if (pct > 100.0) pct = 100.0;
-                printf("\r Segment %d/%d  [%.1f%%]", current_segment - 1, total_segments, pct);
-                fflush(stdout);
+                int abort_req = ctx.progress(ctx.user,
+                                             current_segment - 1,
+                                             total_segments,
+                                             pos, input_size);
+                if (abort_req) { aborted = 1; av_packet_unref(&packet); break; }
             }
 
-            snprintf(output_path, sizeof(output_path), "%s/%s_%0*d%s", output_dir, base_name, width, current_segment, ext);
-            if (open_output_segment(input_ctx, &output_ctx, output_path, max_bytes, stream_map, NULL) < 0) {
+            snprintf(output_path, sizeof(output_path), "%s/%s_%0*d%s",
+                     opts->output_dir, basename, width, current_segment, extension);
+            kiri_status sopen = kiri_open_segment(&ctx, input_ctx, &output_ctx,
+                                                  output_path, prealloc, stream_map);
+            if (sopen != KIRI_OK) {
+                final_status = sopen;
                 av_packet_unref(&packet);
                 break;
             }
 
-            // Reset offsets for new segment so it starts at 0
-            for (unsigned int i = 0; i < input_ctx->nb_streams; i++) {
+            for (unsigned int i = 0; i < input_ctx->nb_streams; i++)
                 states[i].initialized = 0;
-                // Do NOT reset last_dts — we need monotonicity across the input stream
-            }
         }
 
-        // 4. After a forced (non-keyframe) split, drop video packets until the
-        //    next keyframe so the new segment starts cleanly and is independently playable.
-        //    Audio/subtitle packets pass through to maintain continuity.
+        /* After a forced (non-keyframe) split, drop video until the next keyframe
+         * so each segment starts cleanly and is independently playable. */
         if (waiting_for_keyframe) {
             if (is_video) {
-                if (is_keyframe) {
-                    waiting_for_keyframe = 0;
-                } else {
-                    av_packet_unref(&packet);
-                    continue;
-                }
+                if (is_keyframe) waiting_for_keyframe = 0;
+                else { av_packet_unref(&packet); continue; }
             }
         }
 
-        // 5. OFFSET CALCULATION (Zero-base the new segment)
+        /* Zero-base against the unified segment reference */
         if (!st->initialized) {
-            st->pts_offset = packet.pts;
-            st->dts_offset = packet.dts;
+            int64_t ref_in_tb = av_rescale_q(segment_ref_us, AV_TIME_BASE_Q,
+                                             in_stream->time_base);
+            st->pts_offset = ref_in_tb;
+            st->dts_offset = ref_in_tb;
             st->initialized = 1;
         }
 
         av_packet_rescale_ts(&packet, in_stream->time_base, out_stream->time_base);
-
         int64_t pts_off = av_rescale_q(st->pts_offset, in_stream->time_base, out_stream->time_base);
         int64_t dts_off = av_rescale_q(st->dts_offset, in_stream->time_base, out_stream->time_base);
 
         packet.pts -= pts_off;
         packet.dts -= dts_off;
-
         if (packet.dts < 0) packet.dts = 0;
         if (packet.pts < 0) packet.pts = 0;
-        // Guarantee PTS >= DTS (required by muxers)
         if (packet.pts < packet.dts) packet.pts = packet.dts;
 
         packet.stream_index = stream_map[packet.stream_index];
         packet.pos = -1;
 
-        ret = av_interleaved_write_frame(output_ctx, &packet);
+        int wret = av_interleaved_write_frame(output_ctx, &packet);
         av_packet_unref(&packet);
-        if (ret < 0) {
-            fprintf(stderr, "\n Warn: Mux error on packet (segment %d). Continuing...\n", current_segment);
+        if (wret < 0) {
+            kiri_log_ffmpeg(&ctx, KIRI_LOG_WARN, "av_interleaved_write_frame", wret);
         }
     }
 
-    // Finalize last segment
-    close_output_segment(&output_ctx);
+    /* Finalize last segment */
+    kiri_close_segment(&output_ctx);
 
     if (playlist) {
-        // Write last segment entry
         double seg_duration = 0.0;
         if (video_stream_index >= 0) {
             AVRational tb = input_ctx->streams[video_stream_index]->time_base;
@@ -622,15 +543,20 @@ static int split_video(const char *input_file, const char *output_dir, const cha
         }
         fprintf(playlist, "#EXTINF:%.3f,\n%s_%0*d%s\n",
                 seg_duration > 0.0 ? seg_duration : 0.0,
-                base_name, width, current_segment, ext);
+                basename, width, current_segment, extension);
         fprintf(playlist, "#EXT-X-ENDLIST\n");
         fclose(playlist);
     }
 
-    printf("\r Segment %d/%d  [100.0%%]\n", current_segment, total_segments);
+    if (ctx.progress) {
+        ctx.progress(ctx.user, current_segment, total_segments,
+                     input_size, input_size);
+    }
 
     free(stream_map);
     free(states);
     avformat_close_input(&input_ctx);
-    return 0;
+
+    if (aborted) return KIRI_ERR_INTERRUPTED;
+    return final_status;
 }
